@@ -233,8 +233,9 @@ def _get_qs(
     # (B, T', vocab_size)
     logits = logits[:, initial_fixed_length - 1 : -1, :]
     predictions = F.softmax(logits, dim=-1)
-    return torch.gather(predictions, 2, tokens[:, :, None])[:, :, 0]
-
+    output = torch.gather(predictions, 2, tokens[:, :, None])[:, :, 0]
+    na_replaced_output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0)
+    return na_replaced_output
 
 # initial_fixed_length_scenario = LengthSampler(8, T - 2)
 
@@ -346,7 +347,8 @@ def train(resource):
                     reward = torch.log(D) - torch.log(1 - D) - kl_loss
                     reward = reward * reward_factor
 
-                    return reward.mean(dim=-1)
+                    return reward.sum(dim=-1)
+                    # return reward.mean(dim=-1)
 
                 rewards = []
                 for micro_step in range(gradient_accumulation_steps):
