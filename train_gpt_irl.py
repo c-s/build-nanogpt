@@ -18,21 +18,25 @@ from torch.nn import functional as F
 
 torch.set_float32_matmul_precision('high')
 
-expert_hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
-student_hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
+expert_hf_model = GPT2LMHeadModel.from_pretrained(
+    "gpt2",
+    torch_dtype=torch.bfloat16,
+    # is_traiable=True,
+)
+# student_hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
 expert_model = expert_hf_model
-student_model = student_hf_model
+# student_model = student_hf_model
 
 device = "cuda"
 
 expert_model.to(device)
-student_model.to(device)
+# student_model.to(device)
 
 use_compile = False  # np.int error...
 
 if use_compile:
     expert_model = torch.compile(expert_model)
-    student_model = torch.compile(student_model)
+    # student_model = torch.compile(student_model)
 
 
 stu_exp_kl_coef = 0.0  # 0.2
@@ -42,8 +46,10 @@ gradient_accumulation_steps = 1
 disc_cross_entropy_factor = 0.02
 reward_factor = 0.1
 
-base_lr = 5e-6 #1.41e-5
-disc_lr = 5e-6 #1.41e-5
+base_lr = 1.41e-5
+disc_lr = 1.41e-6
+
+gen_update_interval = 1
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -120,9 +126,14 @@ def build_config():
         # )
     )
 
-    ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(ppo_config.model_name)
+    ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        ppo_config.model_name,
+        torch_dtype=torch.bfloat16,
+        is_trainable=True,
+    )
     ppo_ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        ppo_config.model_name
+        ppo_config.model_name,
+        torch_dtype=torch.bfloat16,
     )
     # ppo_model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(ppo_config.model_name)
@@ -314,59 +325,59 @@ def train(resource):
             disc_optimizer.step()
             # disc_loss = 0.0
 
-            def get_rewards(response_tensor) -> torch.Tensor:
-                expert_logits = expert_model(response_tensor)[0].detach()
-                student_logits = student_model(response_tensor)[0]
+            if total_index % gen_update_interval == 0:
+                def get_rewards(response_tensor) -> torch.Tensor:
+                    expert_logits = expert_model(response_tensor)[0].detach()
+                    student_logits = student_model(response_tensor)[0]
 
-                expert_prob = _get_qs(
-                    initial_fixed_length, response_tensor, expert_logits
+                    expert_prob = _get_qs(
+                        initial_fixed_length, response_tensor, expert_logits
+                    )
+                    student_prob = _get_qs(
+                        initial_fixed_length, response_tensor, student_logits
+                    )
+
+                    D = expert_prob / (expert_prob + student_prob)
+
+                    # kl_loss = stu_exp_kl_coef * (torch.log(student_prob) - torch.log(expert_prob))
+                    kl_loss = 0
+                    reward = torch.log(D) - torch.log(1 - D) - kl_loss
+                    reward = reward * reward_factor
+
+                    return reward.mean(dim=-1)
+
+                rewards = []
+                for micro_step in range(gradient_accumulation_steps):
+                    start_batch_index = micro_batch_size * micro_step
+                    end_batch_index = start_batch_index + micro_batch_size
+                    micro_response_tensor = response_tensor[start_batch_index:end_batch_index]
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        rewards.extend(get_rewards(micro_response_tensor))
+                # rewards = [get_reward(student_response) for student_response in response_tensor]
+
+                stats = ppo_trainer.step(
+                    list(query_tensor),
+                    list(response_tensor[:, initial_fixed_length:]),
+                    rewards,
                 )
-                student_prob = _get_qs(
-                    initial_fixed_length, response_tensor, student_logits
+                log_batch = dict(
+                    query=list(list(x) for x in query_tensor),
+                    response=list(list(x) for x in batch[:, initial_fixed_length:]),
+                )
+                ppo_trainer.log_stats(stats, log_batch, rewards)
+
+                gen_loss = get_gen_loss(
+                    expert_model, student_model, response_tensor, initial_fixed_length
                 )
 
-                D = expert_prob / (expert_prob + student_prob)
-
-                # kl_loss = stu_exp_kl_coef * (torch.log(student_prob) - torch.log(expert_prob))
-                kl_loss = 0
-                reward = torch.log(D) - torch.log(1 - D) - kl_loss
-                reward = reward * reward_factor
-
-                return reward.mean(dim=-1)
-
-            rewards = []
-            for micro_step in range(gradient_accumulation_steps):
-                start_batch_index = micro_batch_size * micro_step
-                end_batch_index = start_batch_index + micro_batch_size
-                micro_response_tensor = response_tensor[start_batch_index:end_batch_index]
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    rewards.extend(get_rewards(micro_response_tensor))
-            # rewards = [get_reward(student_response) for student_response in response_tensor]
-
-            stats = ppo_trainer.step(
-                list(query_tensor),
-                list(response_tensor[:, initial_fixed_length:]),
-                rewards,
-            )
-            log_batch = dict(
-                query=list(list(x) for x in query_tensor),
-                response=list(list(x) for x in batch[:, initial_fixed_length:]),
-            )
-            ppo_trainer.log_stats(stats, log_batch, rewards)
-
-
-            gen_loss = get_gen_loss(
-                expert_model, student_model, response_tensor, initial_fixed_length
-            )
-
-            t1 = time.time()
-            dt = t1 - t0
-            tokens_processed = batch_size * seq_length
-            tokens_per_sec = tokens_processed / dt
-            avg_reward = sum(r.item() for r in rewards) / len(rewards)
-            print(
-                f"step: {i}, initial_fixed_length: {initial_fixed_length}, gen_loss: {gen_loss:.3f}, disc_loss: {disc_loss_accum:.3f}, reward: {avg_reward:.4f}, norm: {norm:.4f}, dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}"
-            )
+                t1 = time.time()
+                dt = t1 - t0
+                tokens_processed = batch_size * seq_length
+                tokens_per_sec = tokens_processed / dt
+                avg_reward = sum(r.item() for r in rewards) / len(rewards)
+                print(
+                    f"step: {i}, initial_fixed_length: {initial_fixed_length}, gen_loss: {gen_loss:.3f}, disc_loss: {disc_loss_accum:.3f}, reward: {avg_reward:.4f}, norm: {norm:.4f}, dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}"
+                )
 
             if total_index % 1000 == 0:
                 checkpoint = {
