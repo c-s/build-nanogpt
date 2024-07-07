@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 
 import torch
@@ -14,6 +15,8 @@ from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 from torch.utils.data import IterableDataset
 from torch.nn import functional as F
 
+torch.set_float32_matmul_precision('high')
+
 expert_hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
 student_hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
 expert_model = expert_hf_model
@@ -24,9 +27,16 @@ device = "cuda"
 expert_model.to(device)
 student_model.to(device)
 
-exp_stu_kl_coef = 0.2
-seq_length = 128
+use_compile = False  # np.int error...
 
+if use_compile:
+    expert_model = torch.compile(expert_model)
+    student_model = torch.compile(student_model)
+
+
+stu_exp_kl_coef = 0.2
+seq_length = 64
+batch_size = 32
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -90,11 +100,11 @@ def build_config():
         model_name="gpt2",
         learning_rate=1.41e-5,
         # learning_rate=1.41e-7,
-        batch_size=128,
+        batch_size=batch_size,
         gradient_accumulation_steps=1,
-        mini_batch_size=128,
+        mini_batch_size=batch_size,
         log_with="wandb",
-        kl_penalty="full",
+        # kl_penalty="full",
         # init_kl_coef=0.0,
         # adap_kl_ctrl=False,
         # accelerator_kwargs=dict(
@@ -185,7 +195,7 @@ def get_disc_loss(
         student_path_expert_pred + student_path_student_pred
     )
 
-    kl_loss = exp_stu_kl_coef * (
+    kl_loss = stu_exp_kl_coef * (
         torch.log(student_path_student_pred) - torch.log(student_path_expert_pred)
     )
 
@@ -236,6 +246,7 @@ def train(resource):
     total_index = 0
     while True:
         for i, batch in enumerate(ppo_trainer.dataloader):
+            t0 = time.time()
             # initial_fixed_length = initial_fixed_length_scenario()
             initial_fixed_length = initial_fixed_length_scenario(total_index)
             # gen_loss, disc_loss = irl.get_loss(tokens, 3, use_expert_rollout=True)
@@ -282,7 +293,7 @@ def train(resource):
 
                 D = expert_prob / (expert_prob + student_prob)
 
-                # kl_loss = exp_stu_kl_coef * (torch.log(student_prob) - torch.log(expert_prob))
+                # kl_loss = stu_exp_kl_coef * (torch.log(student_prob) - torch.log(expert_prob))
                 kl_loss = 0
                 reward = torch.log(D) - torch.log(1 - D) - kl_loss
 
@@ -309,8 +320,12 @@ def train(resource):
                 expert_model, student_model, response_tensor, initial_fixed_length
             )
 
+            t1 = time.time()
+            dt = t1 - t0
+            tokens_processed = batch_size * seq_length
+            tokens_per_sec = tokens_processed / dt
             print(
-                f"step: {i}, initial_fixed_length: {initial_fixed_length}, gen_loss: {gen_loss}, disc_loss: {disc_loss}"
+                f"step: {i}, initial_fixed_length: {initial_fixed_length}, gen_loss: {gen_loss:.3f}, disc_loss: {disc_loss:.3f}, dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}"
             )
             total_index += 1
 
