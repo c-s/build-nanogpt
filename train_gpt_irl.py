@@ -1,4 +1,5 @@
 import os
+import pathlib
 import time
 import numpy as np
 
@@ -104,7 +105,7 @@ def build_config():
         gradient_accumulation_steps=1,
         mini_batch_size=batch_size,
         log_with="wandb",
-        # kl_penalty="full",
+        kl_penalty="full",
         # init_kl_coef=0.0,
         # adap_kl_ctrl=False,
         # accelerator_kwargs=dict(
@@ -231,16 +232,21 @@ def train(resource):
     generation_kwargs = resource["generation_kwargs"]
     dataset = resource["dataset"]
 
+    ppo_optimizer = torch.optim.AdamW(
+        ppo_model.parameters(), lr=1.41e-5, betas=(0.9, 0.95), eps=1e-8
+    )
+
     ppo_trainer = PPOTrainer(
         config=ppo_config,
         model=ppo_model,
         ref_model=ppo_ref_model,
         tokenizer=tokenizer,
         dataset=dataset,
+        optimizer=ppo_optimizer,
     )
 
     disc_optimizer = torch.optim.AdamW(
-        expert_model.parameters(), lr=2e-5, betas=(0.9, 0.95), eps=1e-8
+        expert_model.parameters(), lr=1.41e-5, betas=(0.9, 0.95), eps=1e-8
     )
 
     total_index = 0
@@ -327,6 +333,19 @@ def train(resource):
             print(
                 f"step: {i}, initial_fixed_length: {initial_fixed_length}, gen_loss: {gen_loss:.3f}, disc_loss: {disc_loss:.3f}, dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}"
             )
+
+            if total_index % 1000 == 0:
+                checkpoint = {
+                    'expert_model': expert_model.state_dict(),
+                    'student_model': ppo_model.state_dict(),
+                    'ppo_config': ppo_config,
+                    'step': total_index,
+                    'gen_loss': gen_loss.item(),
+                    'disc_loss': disc_loss.item(),
+                }
+                checkpoint_path = pathlib.Path("log/model_{total_index:05d}.pt")
+                checkpoint_path.parent.mkdir(parent=True, exist_ok=True)
+                torch.save(checkpoint, checkpoint_path)
             total_index += 1
 
 
