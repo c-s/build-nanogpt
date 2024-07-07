@@ -16,6 +16,8 @@ from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 from torch.utils.data import IterableDataset
 from torch.nn import functional as F
 
+torch.autograd.set_detect_anomaly(True)
+
 torch.set_float32_matmul_precision('high')
 
 expert_hf_model = GPT2LMHeadModel.from_pretrained(
@@ -47,7 +49,7 @@ disc_cross_entropy_factor = 0.02
 reward_factor = 0.1
 
 base_lr = 1.41e-5
-disc_lr = 1.41e-6
+disc_lr = 1.41e-5
 
 gen_update_interval = 1
 
