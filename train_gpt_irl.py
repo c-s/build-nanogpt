@@ -39,6 +39,8 @@ stu_exp_kl_coef = 0.2
 seq_length = 64
 batch_size = 32
 
+base_lr = 1.41e-6
+
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32)  # added after video
@@ -99,7 +101,7 @@ class FineWebDataset(IterableDataset):
 def build_config():
     ppo_config = PPOConfig(
         model_name="gpt2",
-        learning_rate=1.41e-5,
+        learning_rate=base_lr,
         # learning_rate=1.41e-7,
         batch_size=batch_size,
         gradient_accumulation_steps=1,
@@ -153,16 +155,17 @@ def get_gen_loss(
     idx: torch.Tensor,
     initial_fixed_length: int,
 ):
-    _, T = idx.shape
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        _, T = idx.shape
 
-    expert_pred = _get_qs(initial_fixed_length, idx, expert_model(idx)[0].detach())
-    student_pred = _get_qs(initial_fixed_length, idx, student_model(idx)[0])
+        expert_pred = _get_qs(initial_fixed_length, idx, expert_model(idx)[0].detach())
+        student_pred = _get_qs(initial_fixed_length, idx, student_model(idx)[0])
 
-    D = expert_pred / (expert_pred + student_pred)
+        D = expert_pred / (expert_pred + student_pred)
 
-    loss = -torch.log(D) + torch.log(1 - D)
+        loss = -torch.log(D) + torch.log(1 - D)
 
-    return loss.mean()
+        return loss.mean()
 
 
 def get_disc_loss(
@@ -221,8 +224,12 @@ def _get_qs(
 def initial_fixed_length_scenario(i):
     # # return 32
     m = seq_length - 1
-    return max(16, min(m, m - int(m * (i / 10000))))
+    return max(16, min(m, m - int(m * (i / 500))))
 
+# def initial_fixed_length_scenario(i):
+#     # # return 32
+#     m = T - 1
+#     return max(16, min(m, m - int(m * (i / 500))))
 
 def train(resource):
     ppo_config = resource["ppo_config"]
@@ -233,7 +240,7 @@ def train(resource):
     dataset = resource["dataset"]
 
     ppo_optimizer = torch.optim.AdamW(
-        ppo_model.parameters(), lr=1.41e-5, betas=(0.9, 0.95), eps=1e-8
+        ppo_model.parameters(), lr=base_lr, betas=(0.9, 0.95), eps=1e-8
     )
 
     ppo_trainer = PPOTrainer(
@@ -242,11 +249,11 @@ def train(resource):
         ref_model=ppo_ref_model,
         tokenizer=tokenizer,
         dataset=dataset,
-        optimizer=ppo_optimizer,
+        # optimizer=ppo_optimizer,
     )
 
     disc_optimizer = torch.optim.AdamW(
-        expert_model.parameters(), lr=1.41e-5, betas=(0.9, 0.95), eps=1e-8
+        expert_model.parameters(), lr=base_lr, betas=(0.9, 0.95), eps=1e-8
     )
 
     total_index = 0
@@ -274,13 +281,14 @@ def train(resource):
             expert_model.train()
             expert_model.zero_grad()
             student_model = ppo_trainer.model
-            disc_loss, kl_loss = get_disc_loss(
-                expert_model,
-                student_model,
-                batch,
-                response_tensor,
-                initial_fixed_length,
-            )
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                disc_loss, kl_loss = get_disc_loss(
+                    expert_model,
+                    student_model,
+                    batch,
+                    response_tensor,
+                    initial_fixed_length,
+                )
             sum_loss = disc_loss + kl_loss
             sum_loss.backward()
             disc_optimizer.step()
@@ -305,7 +313,8 @@ def train(resource):
 
                 return reward.mean(dim=-1)
 
-            rewards = get_rewards(response_tensor)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                rewards = get_rewards(response_tensor)
             # rewards = [get_reward(student_response) for student_response in response_tensor]
 
             stats = ppo_trainer.step(
@@ -317,10 +326,8 @@ def train(resource):
                 query=list(list(x) for x in query_tensor),
                 response=list(list(x) for x in batch[:, initial_fixed_length:]),
             )
-            try:
-                ppo_trainer.log_stats(stats, log_batch, list(rewards))
-            except Exception as err:
-                print(err)
+            ppo_trainer.log_stats(stats, log_batch, list(rewards))
+
 
             gen_loss = get_gen_loss(
                 expert_model, student_model, response_tensor, initial_fixed_length
@@ -343,8 +350,8 @@ def train(resource):
                     'gen_loss': gen_loss.item(),
                     'disc_loss': disc_loss.item(),
                 }
-                checkpoint_path = pathlib.Path("log/model_{total_index:05d}.pt")
-                checkpoint_path.parent.mkdir(parent=True, exist_ok=True)
+                checkpoint_path = pathlib.Path(f"log/model_{total_index:05d}.pt")
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(checkpoint, checkpoint_path)
             total_index += 1
 
