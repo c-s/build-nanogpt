@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
+from trl import AutoModelForCausalLMWithValueHead
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
@@ -117,12 +118,17 @@ def iterate_examples(split):
             example = json.loads(line)
             yield example
 
+def add_key_prefix(prefix, d):
+    return dict((prefix + k, v) if "v_head" not in k else (k, v) for k, v in d.items())
+
 @torch.no_grad()
-def evaluate(model_type, device):
+def evaluate(model_type, device, ckpt, ckpt_model):
 
     torch.set_float32_matmul_precision('high') # use tf32
-    model = GPT2LMHeadModel.from_pretrained(model_type)
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(model_type)
     model.to(device)
+    if ckpt is not None:
+        model.load_state_dict(add_key_prefix("pretrained_model.", torch.load(ckpt)[ckpt_model]))
     # model = torch.compile(model) # optionally torch compile the model
 
     num_correct_norm = 0
@@ -134,7 +140,7 @@ def evaluate(model_type, device):
         mask = mask.to(device)
 
         # get the logits
-        logits = model(tokens).logits
+        logits = model(tokens)[0]
         # evaluate the autoregressive loss at all positions
         shift_logits = (logits[..., :-1, :]).contiguous()
         shift_tokens = (tokens[..., 1:]).contiguous()
@@ -173,5 +179,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model_type", type=str, default="gpt2", help="the model type to use")
     parser.add_argument("-d", "--device", type=str, default="cuda", help="the device to use")
+    parser.add_argument("--ckpt", type=str, help="model checkpoint")
+    parser.add_argument("--ckpt-model", type=str, default="student_model", help="model checkpoint")
     args = parser.parse_args()
-    evaluate(args.model_type, args.device)
+    evaluate(args.model_type, args.device, args.ckpt, args.ckpt_model)
