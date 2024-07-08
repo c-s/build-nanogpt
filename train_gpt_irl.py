@@ -49,7 +49,7 @@ disc_cross_entropy_factor = 0.02
 reward_factor = 0.1
 
 base_lr = 1.41e-5
-disc_lr = 1.41e-5
+disc_lr = 1.41e-6
 
 gen_update_interval = 1
 
@@ -362,8 +362,8 @@ def train(resource):
                         reward = expert_log_prob - student_log_prob - kl_loss
                         reward = reward * reward_factor
 
-                        return reward.sum(dim=-1)
-                        # return reward.mean(dim=-1)
+                        # return reward.sum(dim=-1)
+                        return reward.mean(dim=-1)
 
                     rewards = []
                     for micro_step in range(gradient_accumulation_steps):
