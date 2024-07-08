@@ -41,7 +41,7 @@ if use_compile:
     # student_model = torch.compile(student_model)
 
 
-stu_exp_kl_coef = 0.0  # 0.2
+stu_exp_kl_coef = 0  # 0.2
 seq_length = 64
 batch_size = 32
 gradient_accumulation_steps = 1
@@ -175,12 +175,14 @@ def get_gen_loss(
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         _, T = idx.shape
 
-        expert_pred = _get_qs(initial_fixed_length, idx, expert_model(idx)[0].detach())
-        student_pred = _get_qs(initial_fixed_length, idx, student_model(idx)[0])
+        expert_log_prob = _get_qs(initial_fixed_length, idx, expert_model(idx)[0].detach())
+        student_log_prob = _get_qs(initial_fixed_length, idx, student_model(idx)[0])
 
-        D = expert_pred / (expert_pred + student_pred)
+        # D = expert_pred / (expert_pred + student_pred)
 
-        loss = -torch.log(D) + torch.log(1 - D)
+        # loss = -torch.log(D) + torch.log(1 - D)
+
+        loss = -expert_log_prob + student_log_prob
 
         return loss.mean()
 
@@ -194,33 +196,43 @@ def get_disc_loss(
 ):
     _, T = expert_tokens.shape
 
-    expert_path_expert_pred = _get_qs(
+    expert_path_expert_log_prob = _get_qs(
         initial_fixed_length, expert_tokens, expert_model(expert_tokens)[0]
     )
-    expert_path_student_pred = _get_qs(
+    expert_path_student_log_prob = _get_qs(
         initial_fixed_length, expert_tokens, student_model(expert_tokens)[0].detach()
     )
-    student_path_expert_pred = _get_qs(
+    student_path_expert_log_prob = _get_qs(
         initial_fixed_length, student_tokens, expert_model(student_tokens)[0]
     )
-    student_path_student_pred = _get_qs(
+    student_path_student_log_prob = _get_qs(
         initial_fixed_length,
         student_tokens,
         student_model(student_tokens)[0].detach(),
     )
 
-    expert_path_D = expert_path_expert_pred / (
-        expert_path_expert_pred + expert_path_student_pred
+    # expert_path_D = expert_path_expert_pred / (
+    #     expert_path_expert_pred + expert_path_student_pred
+    # )
+
+    log_expert_path_D = (
+        expert_path_expert_log_prob -
+          torch.log(torch.exp(expert_path_expert_log_prob) + torch.exp(expert_path_student_log_prob))
     )
-    student_path_D = student_path_expert_pred / (
-        student_path_expert_pred + student_path_student_pred
+    log_one_minus_student_path_D = (
+        student_path_student_log_prob -
+          torch.log(torch.exp(student_path_expert_log_prob) + torch.exp(student_path_student_log_prob))
     )
 
-    kl_loss = stu_exp_kl_coef * (
-        torch.log(student_path_student_pred) - torch.log(student_path_expert_pred)
-    )
+    if stu_exp_kl_coef == 0:
+        kl_loss = torch.zeros_like(student_path_student_log_prob)
+    else:
+        kl_loss = stu_exp_kl_coef * (
+            student_path_student_log_prob - student_path_expert_log_prob
+        )
 
-    cross_entropy_loss = -torch.log(1 - student_path_D) - torch.log(expert_path_D)
+    # cross_entropy_loss = -torch.log(1 - student_path_D) - torch.log(expert_path_D)
+    cross_entropy_loss = -log_one_minus_student_path_D - log_expert_path_D
     cross_entropy_loss = cross_entropy_loss * disc_cross_entropy_factor
 
     return cross_entropy_loss.mean(), kl_loss.mean()
@@ -232,10 +244,11 @@ def _get_qs(
     tokens = tokens[:, initial_fixed_length:]  # (B, T')
     # (B, T', vocab_size)
     logits = logits[:, initial_fixed_length - 1 : -1, :]
-    predictions = F.softmax(logits, dim=-1)
+    predictions = F.log_softmax(logits, dim=-1)
     output = torch.gather(predictions, 2, tokens[:, :, None])[:, :, 0]
-    na_replaced_output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0)
-    return na_replaced_output
+    return output
+    # na_replaced_output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0)
+    # return na_replaced_output
 
 # initial_fixed_length_scenario = LengthSampler(8, T - 2)
 
@@ -280,122 +293,128 @@ def train(resource):
     total_index = 0
     while True:
         for i, batch in enumerate(ppo_trainer.dataloader):
-            t0 = time.time()
-            # initial_fixed_length = initial_fixed_length_scenario()
-            initial_fixed_length = initial_fixed_length_scenario(total_index)
-            # gen_loss, disc_loss = irl.get_loss(tokens, 3, use_expert_rollout=True)
-            # print(f"step: {i} gen_loss: {gen_loss}, disc_loss: {disc_loss}")
-            max_new_tokens = batch.size(1) - initial_fixed_length
-            query_tensor = batch[:, :initial_fixed_length]
-            response_tensor = torch.full_like(batch, tokenizer.eos_token_id)
+            try:
+                t0 = time.time()
+                # initial_fixed_length = initial_fixed_length_scenario()
+                initial_fixed_length = initial_fixed_length_scenario(total_index)
+                # gen_loss, disc_loss = irl.get_loss(tokens, 3, use_expert_rollout=True)
+                # print(f"step: {i} gen_loss: {gen_loss}, disc_loss: {disc_loss}")
+                max_new_tokens = batch.size(1) - initial_fixed_length
+                query_tensor = batch[:, :initial_fixed_length]
+                response_tensor = torch.full_like(batch, tokenizer.eos_token_id)
 
-            ppo_trainer.model.eval()
-            response_list = ppo_trainer.generate(
-                list(query_tensor),
-                **dict(generation_kwargs, max_new_tokens=max_new_tokens),
-            )
-            # ppo_trainer.model.train()
+                ppo_trainer.model.eval()
+                response_list = ppo_trainer.generate(
+                    list(query_tensor),
+                    **dict(generation_kwargs, max_new_tokens=max_new_tokens),
+                )
+                # ppo_trainer.model.train()
 
-            for res_ind, res in enumerate(response_list):
-                response_tensor[res_ind, : len(res)] = res
+                for res_ind, res in enumerate(response_list):
+                    response_tensor[res_ind, : len(res)] = res
 
-            expert_model.train()
-            expert_model.zero_grad()
-            student_model = ppo_trainer.model
-            disc_loss_accum = 0.0
-            kl_loss_accum = 0.0
-            micro_batch_size = batch_size // gradient_accumulation_steps
-            for micro_step in range(gradient_accumulation_steps):
-                start_batch_index = micro_batch_size * micro_step
-                end_batch_index = start_batch_index + micro_batch_size
-                micro_batch = batch[start_batch_index:end_batch_index]
-                micro_response_tensor = response_tensor[start_batch_index:end_batch_index]
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    micro_disc_loss, micro_kl_loss = get_disc_loss(
-                        expert_model,
-                        student_model,
-                        micro_batch,
-                        micro_response_tensor,
-                        initial_fixed_length,
-                    )
-                    micro_disc_loss = micro_disc_loss / gradient_accumulation_steps
-                    micro_kl_loss = micro_kl_loss / gradient_accumulation_steps
-                    disc_loss_accum += micro_disc_loss.detach()
-                    kl_loss_accum += micro_kl_loss.detach()
-                    micro_sum_loss = micro_disc_loss + micro_kl_loss
-                    micro_sum_loss.backward()
-            norm = torch.nn.utils.clip_grad_norm_(expert_model.parameters(), 1.0)
-            disc_optimizer.step()
-            # disc_loss = 0.0
-
-            if total_index % gen_update_interval == 0:
-                def get_rewards(response_tensor) -> torch.Tensor:
-                    expert_logits = expert_model(response_tensor)[0].detach()
-                    student_logits = student_model(response_tensor)[0]
-
-                    expert_prob = _get_qs(
-                        initial_fixed_length, response_tensor, expert_logits
-                    )
-                    student_prob = _get_qs(
-                        initial_fixed_length, response_tensor, student_logits
-                    )
-
-                    D = expert_prob / (expert_prob + student_prob)
-
-                    # kl_loss = stu_exp_kl_coef * (torch.log(student_prob) - torch.log(expert_prob))
-                    kl_loss = 0
-                    reward = torch.log(D) - torch.log(1 - D) - kl_loss
-                    reward = reward * reward_factor
-
-                    return reward.sum(dim=-1)
-                    # return reward.mean(dim=-1)
-
-                rewards = []
+                expert_model.train()
+                expert_model.zero_grad()
+                student_model = ppo_trainer.model
+                disc_loss_accum = 0.0
+                kl_loss_accum = 0.0
+                micro_batch_size = batch_size // gradient_accumulation_steps
                 for micro_step in range(gradient_accumulation_steps):
                     start_batch_index = micro_batch_size * micro_step
                     end_batch_index = start_batch_index + micro_batch_size
+                    micro_batch = batch[start_batch_index:end_batch_index]
                     micro_response_tensor = response_tensor[start_batch_index:end_batch_index]
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                        rewards.extend(get_rewards(micro_response_tensor))
-                # rewards = [get_reward(student_response) for student_response in response_tensor]
+                        micro_disc_loss, micro_kl_loss = get_disc_loss(
+                            expert_model,
+                            student_model,
+                            micro_batch,
+                            micro_response_tensor,
+                            initial_fixed_length,
+                        )
+                        micro_disc_loss = micro_disc_loss / gradient_accumulation_steps
+                        micro_kl_loss = micro_kl_loss / gradient_accumulation_steps
+                        disc_loss_accum += micro_disc_loss.detach()
+                        kl_loss_accum += micro_kl_loss.detach()
+                        micro_sum_loss = micro_disc_loss + micro_kl_loss
+                        micro_sum_loss.backward()
+                norm = torch.nn.utils.clip_grad_norm_(expert_model.parameters(), 1.0)
+                disc_optimizer.step()
+                # disc_loss = 0.0
 
-                stats = ppo_trainer.step(
-                    list(query_tensor),
-                    list(response_tensor[:, initial_fixed_length:]),
-                    rewards,
-                )
-                log_batch = dict(
-                    query=list(list(x) for x in query_tensor),
-                    response=list(list(x) for x in batch[:, initial_fixed_length:]),
-                )
-                ppo_trainer.log_stats(stats, log_batch, rewards)
+                if total_index % gen_update_interval == 0:
+                    def get_rewards(response_tensor) -> torch.Tensor:
+                        expert_logits = expert_model(response_tensor)[0].detach()
+                        student_logits = student_model(response_tensor)[0]
 
-                gen_loss = get_gen_loss(
-                    expert_model, student_model, response_tensor, initial_fixed_length
-                )
+                        expert_log_prob = _get_qs(
+                            initial_fixed_length, response_tensor, expert_logits
+                        )
+                        student_log_prob = _get_qs(
+                            initial_fixed_length, response_tensor, student_logits
+                        )
 
-                t1 = time.time()
-                dt = t1 - t0
-                tokens_processed = batch_size * seq_length
-                tokens_per_sec = tokens_processed / dt
-                avg_reward = sum(r.item() for r in rewards) / len(rewards)
-                print(
-                    f"step: {i}, initial_fixed_length: {initial_fixed_length}, gen_loss: {gen_loss:.3f}, disc_loss: {disc_loss_accum:.3f}, reward: {avg_reward:.4f}, norm: {norm:.4f}, dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}"
-                )
+                        # D = expert_prob / (expert_prob + student_prob)
 
-            if total_index % 1000 == 0:
-                checkpoint = {
-                    'expert_model': expert_model.state_dict(),
-                    'student_model': ppo_model.state_dict(),
-                    'ppo_config': ppo_config,
-                    'step': total_index,
-                    'gen_loss': gen_loss.item(),
-                    'disc_loss': disc_loss_accum.item(),
-                }
-                checkpoint_path = pathlib.Path(f"log/model_{total_index:05d}.pt")
-                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(checkpoint, checkpoint_path)
-            total_index += 1
+                        # kl_loss = stu_exp_kl_coef * (torch.log(student_prob) - torch.log(expert_prob))
+                        kl_loss = 0
+                        # reward = torch.log(D) - torch.log(1 - D) - kl_loss
+                        reward = expert_log_prob - student_log_prob - kl_loss
+                        reward = reward * reward_factor
+
+                        return reward.sum(dim=-1)
+                        # return reward.mean(dim=-1)
+
+                    rewards = []
+                    for micro_step in range(gradient_accumulation_steps):
+                        start_batch_index = micro_batch_size * micro_step
+                        end_batch_index = start_batch_index + micro_batch_size
+                        micro_response_tensor = response_tensor[start_batch_index:end_batch_index]
+                        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                            rewards.extend(get_rewards(micro_response_tensor))
+                    # rewards = [get_reward(student_response) for student_response in response_tensor]
+
+                    stats = ppo_trainer.step(
+                        list(query_tensor),
+                        list(response_tensor[:, initial_fixed_length:]),
+                        rewards,
+                    )
+                    log_batch = dict(
+                        query=list(list(x) for x in query_tensor),
+                        response=list(list(x) for x in batch[:, initial_fixed_length:]),
+                    )
+                    ppo_trainer.log_stats(stats, log_batch, rewards)
+
+                    gen_loss = get_gen_loss(
+                        expert_model, student_model, response_tensor, initial_fixed_length
+                    )
+
+                    t1 = time.time()
+                    dt = t1 - t0
+                    tokens_processed = batch_size * seq_length
+                    tokens_per_sec = tokens_processed / dt
+                    avg_reward = sum(r.item() for r in rewards) / len(rewards)
+                    print(
+                        f"step: {i}, initial_fixed_length: {initial_fixed_length}, gen_loss: {gen_loss:.3f}, disc_loss: {disc_loss_accum:.3f}, reward: {avg_reward:.4f}, norm: {norm:.4f}, dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}"
+                    )
+
+                if total_index % 1000 == 0:
+                    checkpoint = {
+                        'expert_model': expert_model.state_dict(),
+                        'student_model': ppo_model.state_dict(),
+                        'ppo_config': ppo_config,
+                        'step': total_index,
+                        'gen_loss': gen_loss.item(),
+                        'disc_loss': disc_loss_accum.item(),
+                    }
+                    checkpoint_path = pathlib.Path(f"log/model_{total_index:05d}.pt")
+                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(checkpoint, checkpoint_path)
+                total_index += 1
+            except RuntimeError as err:
+                print(f"{err}")
+                raise
+
 
 
 def main():
