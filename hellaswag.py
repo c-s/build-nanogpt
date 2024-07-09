@@ -128,6 +128,7 @@ def evaluate(model_type, device, ckpt, ckpt_model):
     model = AutoModelForCausalLMWithValueHead.from_pretrained(model_type)
     model.to(device)
     if ckpt is not None:
+        print(f"loading {ckpt_model} from {ckpt}")
         model.load_state_dict(add_key_prefix("pretrained_model.", torch.load(ckpt)[ckpt_model]))
     # model = torch.compile(model) # optionally torch compile the model
 

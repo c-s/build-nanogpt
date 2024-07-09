@@ -23,7 +23,8 @@ torch.set_float32_matmul_precision('high')
 expert_hf_model = GPT2LMHeadModel.from_pretrained(
     "gpt2",
     torch_dtype=torch.bfloat16,
-    # is_traiable=True,
+    attn_implementation="flash_attention_2",
+    # is_trainable=True,
 )
 # student_hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
 expert_model = expert_hf_model
@@ -49,7 +50,7 @@ disc_cross_entropy_factor = 0.02
 reward_factor = 0.1
 
 base_lr = 1.41e-5
-disc_lr = 1.41e-6
+disc_lr = 1.41e-5
 
 gen_update_interval = 1
 
@@ -119,8 +120,8 @@ def build_config():
         gradient_accumulation_steps=gradient_accumulation_steps,
         mini_batch_size=batch_size // gradient_accumulation_steps,
         log_with="wandb",
-        kl_penalty="full",
-        # init_kl_coef=0.0,
+        # kl_penalty="full",
+        init_kl_coef=0.0,
         # adap_kl_ctrl=False,
         # accelerator_kwargs=dict(
         #     # device_placement=False,
@@ -131,11 +132,13 @@ def build_config():
     ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
         ppo_config.model_name,
         torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
         is_trainable=True,
     )
     ppo_ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
         ppo_config.model_name,
         torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
     )
     # ppo_model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(ppo_config.model_name)
@@ -273,8 +276,9 @@ def train(resource):
     generation_kwargs = resource["generation_kwargs"]
     dataset = resource["dataset"]
 
+    ppo_model.to(device)
     ppo_optimizer = torch.optim.AdamW(
-        ppo_model.parameters(), lr=base_lr, betas=(0.9, 0.95), eps=1e-8
+        ppo_model.parameters(), lr=base_lr, betas=(0.9, 0.95), eps=1e-8, fused=True,
     )
 
     ppo_trainer = PPOTrainer(
@@ -283,11 +287,11 @@ def train(resource):
         ref_model=ppo_ref_model,
         tokenizer=tokenizer,
         dataset=dataset,
-        # optimizer=ppo_optimizer,
+        optimizer=ppo_optimizer,
     )
 
     disc_optimizer = torch.optim.AdamW(
-        expert_model.parameters(), lr=disc_lr, betas=(0.9, 0.95), eps=1e-8
+        expert_model.parameters(), lr=disc_lr, betas=(0.9, 0.95), eps=1e-8, fused=True,
     )
 
     total_index = 0
